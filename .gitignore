@@ -1,0 +1,9 @@
+.DS_Store
+DerivedData/
+.build/
+build/
+CwlLlmSwiftLib/Package.resolved
+*.xcuserstate
+xcuserdata/
+.venv/
+Tools/__pycache__/

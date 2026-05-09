@@ -1,0 +1,78 @@
+name: CwlLlmSwift
+options:
+  createIntermediateGroups: true
+  groupOrdering:
+    - order:
+        - App
+        - CwlLlmSwiftLib
+  groupSortPosition: top
+  localPackagesGroup: ""
+  usesTabs: false
+  tabWidth: 4
+  indentWidth: 4
+  schemePathPrefix: ../
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: 26.0
+    EXCLUDED_ARCHS[sdk=macosx*]: x86_64
+    PRODUCT_NAME: $(TARGET_NAME)
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    STRING_CATALOG_GENERATE_SYMBOLS: YES
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
+packages:
+  CwlLlmSwiftLib:
+    path: CwlLlmSwiftLib
+targets:
+  CwlLlmSwift:
+    type: application
+    platform: macOS
+    deploymentTarget: 26.0
+    sources:
+      - path: App/Sources
+        type: syncedFolder
+    dependencies:
+      - package: CwlLlmSwiftLib
+        product: CwlLlmSwiftLib
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: LLM Dataset Package
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.cocoawithlove.llmdataset
+            LSTypeIsPackage: true
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSPrincipalClass: NSApplication
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.cocoawithlove.llmdataset
+            UTTypeDescription: LLM Dataset Package
+            UTTypeConformsTo:
+              - com.apple.package
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - llmdataset
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cocoawithlove.CwlLlmSwift
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_USER_SELECTED_FILES: readwrite
+        GCC_PREPROCESSOR_DEFINITIONS: $(inherited) TESTING=1
+schemes:
+  CwlLlmSwift:
+    build:
+      targets:
+        CwlLlmSwift: all
+    test:
+      targets:
+        - package: CwlLlmSwiftLib/CwlLlmSwiftLibTests

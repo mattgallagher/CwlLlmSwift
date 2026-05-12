@@ -21,4 +21,11 @@ From the following git repository:
 
 Follow the instructions there to clone or download the required files.
 
+> NOTE: you will need to install `git-xet` to correctly download that repository
+>
+>     brew install git-xet
+>     git xet install
+
 In the test harness, you'll be asked to select these files to create a training dataset.
+
+If you get an error in the app that the training dataset isn't UInt16 formatted, it probably means `git-xet` wasn't installed when you cloned the llmc-starter-pack repo.

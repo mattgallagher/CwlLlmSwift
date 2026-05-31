@@ -41,6 +41,7 @@ struct InferenceView: View {
     let errorMessage: String?
     let selectedSourceName: String
     let canGenerate: Bool
+    let selectedCompiledModelURL: URL?
     let inferenceComparisonResults: [InferenceComparisonResult]
     let isRunningInferenceComparison: Bool
     let canRunInferenceComparison: Bool
@@ -48,6 +49,7 @@ struct InferenceView: View {
     let inferenceComparisonErrorMessage: String?
     let availableComparisonEngines: [LLMEngineDescriptor]
     @Binding var selectedInferenceComparisonEngineIDs: Set<LLMEngineIdentifier>
+    @Binding var includeCompiledModelInInferenceComparison: Bool
     let generate: (String, Int, Double) -> Void
     let stop: () -> Void
     let runInferenceComparison: (String, Int, Double) -> Void
@@ -112,6 +114,10 @@ struct InferenceView: View {
                                         }
                                     ))
                                 }
+                                if selectedCompiledModelURL != nil {
+                                    Divider()
+                                    Toggle(selectedCompiledModelURL?.lastPathComponent ?? "Selected mlpackage", isOn: $includeCompiledModelInInferenceComparison)
+                                }
                             } label: {
                                 Label(
                                     "Sources (\(selectedSourceCount)/\(availableSourceCount))",
@@ -123,6 +129,13 @@ struct InferenceView: View {
 
                             Button("Toggle All", action: toggleAllSources)
                                 .disabled(isRunningInferenceComparison || availableSourceCount == 0)
+
+                            Spacer()
+
+                            if let selectedCompiledModelURL {
+                                Text("mlpackage: \(selectedCompiledModelURL.lastPathComponent)")
+                                    .foregroundStyle(.secondary)
+                            }
                         }
 
                         HStack {
@@ -178,20 +191,26 @@ struct InferenceView: View {
     }
 
     private var availableSourceCount: Int {
-        availableComparisonEngines.count
+        availableComparisonEngines.count + (selectedCompiledModelURL == nil ? 0 : 1)
     }
 
     private var selectedSourceCount: Int {
         selectedInferenceComparisonEngineIDs.intersection(Set(availableComparisonEngines.map(\.id))).count
+            + (selectedCompiledModelURL != nil && includeCompiledModelInInferenceComparison ? 1 : 0)
     }
 
     private func toggleAllSources() {
         let availableEngineIDs = Set(availableComparisonEngines.map(\.id))
         let allEnginesSelected = !availableEngineIDs.isEmpty && availableEngineIDs.isSubset(of: selectedInferenceComparisonEngineIDs)
-        if allEnginesSelected {
+        let compiledSelected = selectedCompiledModelURL == nil || includeCompiledModelInInferenceComparison
+        if allEnginesSelected && compiledSelected {
             selectedInferenceComparisonEngineIDs.subtract(availableEngineIDs)
+            includeCompiledModelInInferenceComparison = false
         } else {
             selectedInferenceComparisonEngineIDs.formUnion(availableEngineIDs)
+            if selectedCompiledModelURL != nil {
+                includeCompiledModelInInferenceComparison = true
+            }
         }
     }
 

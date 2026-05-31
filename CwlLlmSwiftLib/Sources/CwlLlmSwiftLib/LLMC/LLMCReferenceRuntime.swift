@@ -21,7 +21,20 @@ enum LLMCReferenceRuntimeError: LocalizedError {
     }
 }
 
-private final class LLMCReferenceSession {
+extension LLMCReferenceRuntime: LLMTrainingStreamRuntime {
+    typealias Model = LLMCReferenceSession
+
+    nonisolated var descriptor: LLMEngineDescriptor { LLMEngineDescriptor(
+        id: .cReference,
+        displayName: "llm.c",
+        summary: "Vendored CPU reference path from train_gpt2.c for training, inference, checkpointing, and numerical validation.",
+        capabilities: [.training, .inference, .checkpointing],
+        isAvailable: true,
+        availabilityNote: "Reference backend supports training, generation, and checkpoint export/load."
+    ) }
+}
+
+final class LLMCReferenceSession {
     private let model = UnsafeMutablePointer<GPT2>.allocate(capacity: 1)
     private let trainLoader = UnsafeMutablePointer<DataLoader>.allocate(capacity: 1)
     private let validationLoader = UnsafeMutablePointer<DataLoader>.allocate(capacity: 1)
@@ -233,62 +246,49 @@ private final class LLMCReferenceSession {
     }
 }
 
+private struct LLMCReferenceInferenceContext: @unchecked Sendable {
+    let session: LLMCReferenceSession
+    let tokenizer: LLMTokenizer
+    let promptTokens: [Int]
+}
+
 actor LLMCReferenceRuntime {
-    private var session: LLMCReferenceSession?
     private var currentCheckpointData: Data?
-    private var trainData: Data?
-    private var validationData: Data?
     private var tokenizerData: Data?
     private var batchSize = 4
     private var sequenceLength = 64
-    private var completedStepCount = 0
 
     func loadCheckpoint(data: Data) async throws {
         currentCheckpointData = data
-        completedStepCount = 0
-        try recreateSession(needsTrainingData: false)
     }
 
     func exportCheckpoint() async throws -> Data {
-        try ensureSession(needsTrainingData: false)
-        guard let session else {
+        guard let currentCheckpointData else {
             throw LLMCReferenceRuntimeError.missingCheckpoint
         }
-        let checkpointData = try session.exportCheckpoint()
-        currentCheckpointData = checkpointData
-        return checkpointData
+        return currentCheckpointData
     }
 
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        trainData = request.trainData
-        validationData = request.validationData
+    func prepareTraining(request: LLMTrainingRequest) async throws -> LLMCReferenceSession {
         tokenizerData = request.tokenizerData
         batchSize = request.batchSize
         sequenceLength = request.sequenceLength
         if let checkpointData = request.checkpointData {
             currentCheckpointData = checkpointData
         }
-        completedStepCount = 0
-        try recreateSession(needsTrainingData: true)
-
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self.trainingLoop(request: request, continuation: continuation)
-                    self.releaseTrainingState()
-                    continuation.finish()
-                } catch {
-                    self.releaseTrainingState()
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
+        guard let currentCheckpointData else {
+            throw LLMCReferenceRuntimeError.missingCheckpoint
         }
+        return try LLMCReferenceSession(
+            checkpointData: currentCheckpointData,
+            trainData: request.trainData,
+            validationData: request.validationData,
+            batchSize: batchSize,
+            sequenceLength: sequenceLength
+        )
     }
 
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
+    fileprivate func prepareInference(request: LLMInferenceRequest) async throws -> LLMCReferenceInferenceContext {
         if let checkpointData = request.checkpointData {
             currentCheckpointData = checkpointData
         }
@@ -299,22 +299,19 @@ actor LLMCReferenceRuntime {
             throw LLMCReferenceRuntimeError.tokenizerRequired
         }
         let tokenizer = try LLMTokenizer(data: tokenizerData)
-        try ensureSession(needsTrainingData: false)
-        guard let session else {
-            throw LLMCReferenceRuntimeError.failedToCreateSession
-        }
+        let session = try recreateSession()
 
         let promptTokens = tokenizer.encodePrompt(request.prompt, maximumTokenCount: session.sequenceLength)
+        return LLMCReferenceInferenceContext(session: session, tokenizer: tokenizer, promptTokens: promptTokens)
+    }
+
+    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
+        let context = try await prepareInference(request: request)
+
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.inferenceLoop(
-                        session: session,
-                        tokenizer: tokenizer,
-                        promptTokens: promptTokens,
-                        request: request,
-                        continuation: continuation
-                    )
+                    try await self.inferenceLoop(context: context, request: request, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -326,23 +323,28 @@ actor LLMCReferenceRuntime {
         }
     }
 
-    private func trainingLoop(
+    func trainingLoop(
+        model session: inout LLMCReferenceSession,
         request: LLMTrainingRequest,
+        preparationStart: ContinuousClock.Instant,
         continuation: AsyncThrowingStream<LLMTrainingProgress, Error>.Continuation
     ) async throws {
-        try ensureSession(needsTrainingData: true)
-        guard let session else {
-            throw LLMCReferenceRuntimeError.failedToCreateSession
+        guard request.stepCount > 0 else {
+            currentCheckpointData = try session.exportCheckpoint()
+            return
         }
 
-        for _ in 0..<request.stepCount {
+        for step in 1...request.stepCount {
             try Task.checkCancellation()
-            completedStepCount += 1
-            let progress = try session.trainStep(step: completedStepCount, learningRate: request.learningRate, validationBatchCount: request.validationBatchCount)
+            let stepStart = ContinuousClock.now
+            let progress = try session.trainStep(step: step, learningRate: request.learningRate, validationBatchCount: request.validationBatchCount)
+            let elapsed = step == 1
+                ? preparationStart.duration(to: .now)
+                : stepStart.duration(to: .now)
             continuation.yield(
                 LLMTrainingProgress(
-                    step: completedStepCount,
-                    iterationsPerSecond: progress.iterationsPerSecond,
+                    step: step,
+                    iterationsPerSecond: elapsed.iterationsPerSecond,
                     forwardPassMilliseconds: progress.forwardPassMilliseconds,
                     backwardPassMilliseconds: progress.backwardPassMilliseconds,
                     trainingLoss: progress.trainingLoss,
@@ -354,13 +356,14 @@ actor LLMCReferenceRuntime {
         currentCheckpointData = try session.exportCheckpoint()
     }
 
-    private func inferenceLoop(
-        session: LLMCReferenceSession,
-        tokenizer: LLMTokenizer,
-        promptTokens: [Int],
+    fileprivate func inferenceLoop(
+        context: LLMCReferenceInferenceContext,
         request: LLMInferenceRequest,
         continuation: AsyncThrowingStream<LLMInferenceChunk, Error>.Continuation
     ) async throws {
+        let session = context.session
+        let tokenizer = context.tokenizer
+        let promptTokens = context.promptTokens
         var (generationTokens, startIndex, totalCount) = session.prepareGenerationTokens(
             promptTokens: promptTokens,
             maximumTokenCount: request.maximumTokenCount,
@@ -390,39 +393,23 @@ actor LLMCReferenceRuntime {
         }
     }
 
-    private func ensureSession(needsTrainingData: Bool) throws {
-        if session == nil {
-            try recreateSession(needsTrainingData: needsTrainingData)
-        }
-    }
-
-    private func recreateSession(needsTrainingData: Bool) throws {
+    private func recreateSession() throws -> LLMCReferenceSession {
         guard let checkpointData = currentCheckpointData else {
             throw LLMCReferenceRuntimeError.missingCheckpoint
         }
-        if needsTrainingData, (trainData == nil || validationData == nil) {
-            throw LLMCReferenceRuntimeError.failedToCreateSession
-        }
 
-        session = try LLMCReferenceSession(
+        return try LLMCReferenceSession(
             checkpointData: checkpointData,
-            trainData: needsTrainingData ? trainData : nil,
-            validationData: needsTrainingData ? validationData : nil,
+            trainData: nil,
+            validationData: nil,
             batchSize: batchSize,
             sequenceLength: sequenceLength
         )
     }
 
-    // Drops the in-memory session (which owns the GPT2 + DataLoader native
-    // allocations and temp files) and the dataset buffers after a training
-    // run so running multiple engines back-to-back (e.g. on the Comparison
-    // screen) doesn't accumulate ~3-4GB of state per engine. The session can
-    // be rebuilt on demand from `currentCheckpointData` if inference or
-    // export follows.
-    private func releaseTrainingState() {
-        session = nil
-        trainData = nil
-        validationData = nil
+    // Drops request-scoped training assets after a run while retaining the
+    // latest checkpoint for export or follow-up inference.
+    func releaseTrainingState() async {
         tokenizerData = nil
     }
 
@@ -430,10 +417,9 @@ actor LLMCReferenceRuntime {
     // checkpoint, so a fully idle engine retains effectively nothing. Callers
     // (e.g. the Comparison screen) invoke this when they're done with an
     // engine for now and don't intend to immediately call exportCheckpoint.
-    func releaseResources() {
-        releaseTrainingState()
+    func releaseResources() async {
+        await releaseTrainingState()
         currentCheckpointData = nil
-        completedStepCount = 0
     }
 }
 

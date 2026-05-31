@@ -54,9 +54,6 @@ let package = Package(
                 .product(name: "Numerics", package: "swift-numerics"),
             ],
             path: "Sources/CwlLlmSwiftLib",
-            resources: [
-                .process("LLMMetal/gpt2.metal"),
-            ],
             swiftSettings: [
                 .unsafeFlags([
                     "-remove-runtime-asserts",

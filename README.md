@@ -2,9 +2,7 @@
 
 Swift implementations of [`llm.c`](https://github.com/karpathy/llm.c), plus a SwiftUI test harness for training, inference, and cross-implementation validation.
 
-This branch contains the phase-1 engines only: `llm.c`, Basic Swift, Fast Swift, Multithreaded Swift, Direct AMX, and Metal.
-
-Parts of this repository vendor and modify code by Andrej Karpathy from [`llm.c`](https://github.com/karpathy/llm.c) and James Thompson from [llm.metal](https://github.com/regrettable-username/llm.metal) both under the MIT License.
+Parts of this repository vendor and modify code by Andrej Karpathy from [`llm.c`](https://github.com/karpathy/llm.c) and James Thompson from [llm.metal](https://github.com/regrettable-username/llm.metal) both under the MIT License. I'd also like to acknowledge https://github.com/madebyollin/maple-diffusion for helping me understand MPSGraph.
 
 ## Getting started
 

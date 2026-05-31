@@ -861,7 +861,6 @@ struct MetalActivationBuffers {
 enum LLMMetalRuntimeError: LocalizedError {
     case missingCheckpoint
     case failedToCreateModel
-    case invalidDataset(String)
     case tokenizerRequired
     case noMetalDevice
     case failedToCreateCommandQueue
@@ -872,7 +871,6 @@ enum LLMMetalRuntimeError: LocalizedError {
         switch self {
         case .missingCheckpoint: "A checkpoint is required before running the Metal backend."
         case .failedToCreateModel: "Failed to create the Metal model runtime."
-        case .invalidDataset(let msg): msg
         case .tokenizerRequired: "Inference requires a tokenizer asset."
         case .noMetalDevice: "No Metal device available."
         case .failedToCreateCommandQueue: "Failed to create a Metal command queue."

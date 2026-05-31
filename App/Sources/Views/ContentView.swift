@@ -1,5 +1,7 @@
+import AppKit
 import CwlLlmSwiftLib
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Binding var document: LLMDatasetDocument
@@ -30,12 +32,15 @@ struct ContentView: View {
     @State private var comparisonErrorMessage: String?
     @State private var comparisonStepCount = 20
     @State private var selectedComparisonEngineIDs: Set<LLMEngineIdentifier>
+    @State private var usesCompiledModelForInference = false
+    @State private var selectedCompiledModelURL: URL?
     @State private var inferenceComparisonResults: [InferenceComparisonResult] = []
     @State private var isRunningInferenceComparison = false
     @State private var inferenceComparisonTask: Task<Void, Never>?
     @State private var inferenceComparisonStatusMessage: String?
     @State private var inferenceComparisonErrorMessage: String?
     @State private var selectedInferenceComparisonEngineIDs: Set<LLMEngineIdentifier>
+    @State private var includeCompiledModelInInferenceComparison = false
 
     init(document: Binding<LLMDatasetDocument>) {
         self._document = document
@@ -100,6 +105,7 @@ struct ContentView: View {
                                 errorMessage: errorMessage,
                                 selectedSourceName: selectedInferenceSourceName,
                                 canGenerate: selectedInferenceCanGenerate,
+                                selectedCompiledModelURL: selectedCompiledModelURL,
                                 inferenceComparisonResults: inferenceComparisonResults,
                                 isRunningInferenceComparison: isRunningInferenceComparison,
                                 canRunInferenceComparison: canRunInferenceComparison,
@@ -107,6 +113,7 @@ struct ContentView: View {
                                 inferenceComparisonErrorMessage: inferenceComparisonErrorMessage,
                                 availableComparisonEngines: inferenceAvailableEngines,
                                 selectedInferenceComparisonEngineIDs: $selectedInferenceComparisonEngineIDs,
+                                includeCompiledModelInInferenceComparison: $includeCompiledModelInInferenceComparison,
                                 generate: runInference,
                                 stop: stopInference,
                                 runInferenceComparison: startInferenceComparison,
@@ -167,17 +174,49 @@ struct ContentView: View {
                 
                 ToolbarItem(placement: .primaryAction) {
                     if selectedTab != .comparison {
-                        Picker("Engine", selection: $selectedEngineID) {
-                            ForEach(engineRegistry.descriptors) { descriptor in
-                                Label {
-                                    Text(descriptor.displayName)
-                                } icon: {
-                                    Image(systemName: "shippingbox")
+                        if selectedTab == .inference {
+                            Menu {
+                                ForEach(inferenceAvailableEngines) { descriptor in
+                                    Button {
+                                        usesCompiledModelForInference = false
+                                        selectedEngineID = descriptor.id
+                                    } label: {
+                                        Label(
+                                            descriptor.displayName,
+                                            systemImage: !usesCompiledModelForInference && selectedEngineID == descriptor.id ? "checkmark" : "shippingbox"
+                                        )
+                                    }
                                 }
-                                .labelStyle(.titleAndIcon)
+                                Divider()
+                                if let selectedCompiledModelURL {
+                                    Button {
+                                        usesCompiledModelForInference = true
+                                    } label: {
+                                        Label(
+                                            selectedCompiledModelURL.lastPathComponent,
+                                            systemImage: usesCompiledModelForInference ? "checkmark" : "cube.box"
+                                        )
+                                    }
+                                }
+                                Button("Choose mlpackage...") {
+                                    chooseCompiledModel()
+                                }
+                            } label: {
+                                Label(selectedInferenceSourceName, systemImage: usesCompiledModelForInference ? "cube.box" : "shippingbox").labelStyle(.titleAndIcon)
                             }
+                        } else {
+                            Picker("Engine", selection: $selectedEngineID) {
+                                ForEach(engineRegistry.descriptors) { descriptor in
+                                    Label {
+                                        Text(descriptor.displayName)
+                                    } icon: {
+                                        Image(systemName: "shippingbox")
+                                    }
+                                    .labelStyle(.titleAndIcon)
+                                }
+                            }
+                            .pickerStyle(.menu)
                         }
-                        .pickerStyle(.menu)
                     }
                 }
             }
@@ -188,16 +227,27 @@ struct ContentView: View {
         engineRegistry.engine(for: selectedEngineID)
     }
 
+    private var selectedInferenceEngine: (any LLMEngine)? {
+        usesCompiledModelForInference ? nil : selectedEngine
+    }
+
     private var selectedInferenceSourceName: String {
+        if usesCompiledModelForInference {
+            return selectedCompiledModelURL?.lastPathComponent ?? "Selected mlpackage"
+        }
         return selectedEngine?.descriptor.displayName ?? "Engine"
     }
 
     private var selectedInferenceCanGenerate: Bool {
+        if usesCompiledModelForInference {
+            return selectedCompiledModelURL != nil
+        }
         return selectedEngine?.descriptor.capabilities.contains(.inference) ?? false
     }
 
     private var canRunInferenceComparison: Bool {
-        selectedInferenceComparisonEngineIDs.intersection(Set(inferenceAvailableEngines.map(\.id))).isEmpty == false
+        let selectedEngineCount = selectedInferenceComparisonEngineIDs.intersection(Set(inferenceAvailableEngines.map(\.id))).count
+        return selectedEngineCount > 0 || (selectedCompiledModelURL != nil && includeCompiledModelInInferenceComparison)
     }
     private func initializeCheckpointSelection() {
         let availableCheckpointIDs = Set(document.availableCheckpoints.map(\.id))
@@ -303,12 +353,14 @@ struct ContentView: View {
     }
 
     private func runInference(prompt: String, maximumTokenCount: Int, temperature: Double) {
-        guard selectedEngine != nil else {
-            return
-        }
-        guard document.currentCheckpointData != nil else {
-            errorMessage = "Load the Initial or a manual checkpoint before running inference."
-            return
+        if !usesCompiledModelForInference {
+            guard selectedEngine != nil else {
+                return
+            }
+            guard document.currentCheckpointData != nil else {
+                errorMessage = "Load the Initial or a manual checkpoint before running inference."
+                return
+            }
         }
 
         errorMessage = nil
@@ -328,10 +380,19 @@ struct ContentView: View {
                     checkpointData: document.currentCheckpointData
                 )
                 let stream: AsyncThrowingStream<LLMInferenceChunk, Error>
-                guard let engine = selectedEngine else {
-                    return
+                if usesCompiledModelForInference {
+                    guard let selectedCompiledModelURL else {
+                        throw CocoaError(.fileNoSuchFile)
+                    }
+                    stream = try await CompiledModelInferenceRunner.startInference(modelURL: selectedCompiledModelURL, request: request)
+                } else {
+                    guard let engine = selectedInferenceEngine else {
+                        return
+                    }
+                    stream = try await engine.startInference(
+                        request: request
+                    )
                 }
-                stream = try await engine.startInference(request: request)
 
                 for try await chunk in stream {
                     await MainActor.run {
@@ -365,6 +426,38 @@ struct ContentView: View {
         inferenceTask = nil
     }
 
+    private func chooseCompiledModel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "mlpackage", conformingTo: .package) ?? .package]
+        panel.message = "Choose a compiled Core ML model package (.mlpackage)."
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        guard url.pathExtension == "mlpackage" else {
+            errorMessage = "Choose a compiled Core ML model package ending in .mlpackage."
+            return
+        }
+        selectedCompiledModelURL = url
+        usesCompiledModelForInference = true
+        includeCompiledModelInInferenceComparison = true
+        errorMessage = nil
+        statusMessage = "Selected \(url.lastPathComponent) for compiled-model inference."
+    }
+
+    private func clearCompiledModel() {
+        let wasSelected = usesCompiledModelForInference
+        usesCompiledModelForInference = false
+        selectedCompiledModelURL = nil
+        includeCompiledModelInInferenceComparison = false
+        if selectedTab == .inference {
+            statusMessage = wasSelected ? "Cleared the compiled model selection." : statusMessage
+        }
+    }
+
     private func startInferenceComparison(prompt: String, maximumTokenCount: Int, temperature: Double) {
         guard !isRunningInference else {
             inferenceComparisonErrorMessage = "Stop text generation before running an inference comparison."
@@ -387,11 +480,22 @@ struct ContentView: View {
             inferenceComparisonErrorMessage = "Load the Initial or a manual checkpoint before comparing engine inference."
             return
         }
+        let includeCompiledModel = includeCompiledModelInInferenceComparison && selectedCompiledModelURL != nil
 
         inferenceComparisonErrorMessage = nil
         inferenceComparisonStatusMessage = "Preparing inference comparison..."
         inferenceComparisonResults = selectedEngineDescriptors.map {
             InferenceComparisonResult(id: $0.id.rawValue, engineName: $0.displayName, status: .pending, generatedTokenCount: 0)
+        }
+        if includeCompiledModel, let selectedCompiledModelURL {
+            inferenceComparisonResults.append(
+                InferenceComparisonResult(
+                    id: "mlpackage:\(selectedCompiledModelURL.lastPathComponent)",
+                    engineName: selectedCompiledModelURL.lastPathComponent,
+                    status: .pending,
+                    generatedTokenCount: 0
+                )
+            )
         }
         isRunningInferenceComparison = true
         inferenceComparisonTask?.cancel()
@@ -422,19 +526,30 @@ struct ContentView: View {
                 do {
                     let start = ContinuousClock.now
                     let stream = try await engine.startInference(request: request)
-                    var isFirstOutput = true
+                    var firstOutputTime: ContinuousClock.Instant?
                     var generatedTokenCount = 0
                     for try await chunk in stream {
                         let elapsed = start.duration(to: .now)
                         let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
                         generatedTokenCount = chunk.generatedTokenCount
-                        let firstOutputMilliseconds = isFirstOutput ? elapsedSeconds * 1_000 : nil
-                        isFirstOutput = false
+                        let firstOutputMilliseconds: Double?
+                        let tokensPerSecond: Double?
+                        if let firstOutputTime {
+                            firstOutputMilliseconds = nil
+                            let generationElapsed = firstOutputTime.duration(to: .now)
+                            let generationElapsedSeconds = Double(generationElapsed.components.seconds) + Double(generationElapsed.components.attoseconds) / 1e18
+                            let postFirstTokenCount = max(0, chunk.generatedTokenCount - 1)
+                            tokensPerSecond = generationElapsedSeconds > 0 ? Double(postFirstTokenCount) / generationElapsedSeconds : nil
+                        } else {
+                            firstOutputTime = .now
+                            firstOutputMilliseconds = elapsedSeconds * 1_000
+                            tokensPerSecond = nil
+                        }
                         await MainActor.run {
                             if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
                                 inferenceComparisonResults[index].generatedTokenCount = chunk.generatedTokenCount
                                 inferenceComparisonResults[index].totalElapsedSeconds = elapsedSeconds
-                                inferenceComparisonResults[index].tokensPerSecond = elapsedSeconds > 0 ? Double(chunk.generatedTokenCount) / elapsedSeconds : nil
+                                inferenceComparisonResults[index].tokensPerSecond = tokensPerSecond
                                 if let firstOutputMilliseconds {
                                     inferenceComparisonResults[index].timeToFirstOutputMilliseconds = firstOutputMilliseconds
                                 }
@@ -448,7 +563,14 @@ struct ContentView: View {
                             inferenceComparisonResults[index].status = .completed
                             inferenceComparisonResults[index].generatedTokenCount = generatedTokenCount
                             inferenceComparisonResults[index].totalElapsedSeconds = totalElapsedSeconds
-                            inferenceComparisonResults[index].tokensPerSecond = totalElapsedSeconds > 0 ? Double(generatedTokenCount) / totalElapsedSeconds : nil
+                            if let firstOutputTime {
+                                let generationElapsed = firstOutputTime.duration(to: .now)
+                                let generationElapsedSeconds = Double(generationElapsed.components.seconds) + Double(generationElapsed.components.attoseconds) / 1e18
+                                let postFirstTokenCount = max(0, generatedTokenCount - 1)
+                                inferenceComparisonResults[index].tokensPerSecond = generationElapsedSeconds > 0 ? Double(postFirstTokenCount) / generationElapsedSeconds : nil
+                            } else {
+                                inferenceComparisonResults[index].tokensPerSecond = nil
+                            }
                         }
                     }
                 } catch is CancellationError {
@@ -469,6 +591,82 @@ struct ContentView: View {
                 }
 
                 await engine.releaseResources()
+            }
+
+            if includeCompiledModel, let selectedCompiledModelURL, !Task.isCancelled {
+                let resultID = "mlpackage:\(selectedCompiledModelURL.lastPathComponent)"
+                await MainActor.run {
+                    if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
+                        inferenceComparisonResults[index].status = .running
+                    }
+                    inferenceComparisonStatusMessage = "Running \(selectedCompiledModelURL.lastPathComponent)..."
+                }
+
+                do {
+                    let start = ContinuousClock.now
+                    let stream = try await CompiledModelInferenceRunner.startInference(modelURL: selectedCompiledModelURL, request: request)
+                    var firstOutputTime: ContinuousClock.Instant?
+                    var generatedTokenCount = 0
+                    for try await chunk in stream {
+                        let elapsed = start.duration(to: .now)
+                        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                        generatedTokenCount = chunk.generatedTokenCount
+                        let firstOutputMilliseconds: Double?
+                        let tokensPerSecond: Double?
+                        if let firstOutputTime {
+                            firstOutputMilliseconds = nil
+                            let generationElapsed = firstOutputTime.duration(to: .now)
+                            let generationElapsedSeconds = Double(generationElapsed.components.seconds) + Double(generationElapsed.components.attoseconds) / 1e18
+                            let postFirstTokenCount = max(0, chunk.generatedTokenCount - 1)
+                            tokensPerSecond = generationElapsedSeconds > 0 ? Double(postFirstTokenCount) / generationElapsedSeconds : nil
+                        } else {
+                            firstOutputTime = .now
+                            firstOutputMilliseconds = elapsedSeconds * 1_000
+                            tokensPerSecond = nil
+                        }
+                        await MainActor.run {
+                            if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
+                                inferenceComparisonResults[index].generatedTokenCount = chunk.generatedTokenCount
+                                inferenceComparisonResults[index].totalElapsedSeconds = elapsedSeconds
+                                inferenceComparisonResults[index].tokensPerSecond = tokensPerSecond
+                                if let firstOutputMilliseconds {
+                                    inferenceComparisonResults[index].timeToFirstOutputMilliseconds = firstOutputMilliseconds
+                                }
+                            }
+                        }
+                    }
+                    let totalElapsed = start.duration(to: .now)
+                    let totalElapsedSeconds = Double(totalElapsed.components.seconds) + Double(totalElapsed.components.attoseconds) / 1e18
+                    await MainActor.run {
+                        if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
+                            inferenceComparisonResults[index].status = .completed
+                            inferenceComparisonResults[index].generatedTokenCount = generatedTokenCount
+                            inferenceComparisonResults[index].totalElapsedSeconds = totalElapsedSeconds
+                            if let firstOutputTime {
+                                let generationElapsed = firstOutputTime.duration(to: .now)
+                                let generationElapsedSeconds = Double(generationElapsed.components.seconds) + Double(generationElapsed.components.attoseconds) / 1e18
+                                let postFirstTokenCount = max(0, generatedTokenCount - 1)
+                                inferenceComparisonResults[index].tokensPerSecond = generationElapsedSeconds > 0 ? Double(postFirstTokenCount) / generationElapsedSeconds : nil
+                            } else {
+                                inferenceComparisonResults[index].tokensPerSecond = nil
+                            }
+                        }
+                    }
+                } catch is CancellationError {
+                    await MainActor.run {
+                        if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
+                            inferenceComparisonResults[index].status = .cancelled
+                        }
+                    }
+                    wasCancelled = true
+                } catch {
+                    await MainActor.run {
+                        if let index = inferenceComparisonResults.firstIndex(where: { $0.id == resultID }) {
+                            inferenceComparisonResults[index].status = .failed
+                            inferenceComparisonResults[index].errorMessage = error.localizedDescription
+                        }
+                    }
+                }
             }
 
             await MainActor.run {

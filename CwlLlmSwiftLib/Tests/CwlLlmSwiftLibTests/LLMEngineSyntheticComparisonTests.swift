@@ -1,5 +1,7 @@
 import CLLMCReference
+import CoreML
 import Foundation
+import MetalPerformanceShadersGraph
 import XCTest
 @testable import CwlLlmSwiftLib
 
@@ -8,6 +10,15 @@ private struct ComparisonTolerance {
     let activations: Float
     let gradients: Float
     let parameters: Float
+}
+
+private extension Array where Element == Double {
+    var average: Double? {
+        guard isEmpty == false else {
+            return nil
+        }
+        return reduce(0, +) / Double(count)
+    }
 }
 
 private struct SyntheticFixture {
@@ -66,33 +77,42 @@ private struct ModelSnapshot {
     let activations: [Float]
 }
 
+private struct TrainingRunSnapshot {
+    let progress: [LLMTrainingProgress]
+    let checkpointData: Data
+}
+
 final class LLMEngineSyntheticComparisonTests: XCTestCase {
     private enum EngineCase: CaseIterable {
         case basicSwift
         case fastSwift
-        case multithreadedSwift
+        case blas
         case amx
+        case bnns
 
         var name: String {
             switch self {
             case .basicSwift: "Basic Swift"
             case .fastSwift: "Fast Swift"
-            case .multithreadedSwift: "Multithreaded Swift"
+            case .blas: "BLAS"
             case .amx: "Direct AMX"
+            case .bnns: "BNNS"
             }
         }
 
         var tolerance: ComparisonTolerance {
             switch self {
-            case .basicSwift, .fastSwift, .multithreadedSwift:
+            case .basicSwift, .fastSwift:
                 ComparisonTolerance(loss: 1e-5, activations: 5e-5, gradients: 1e-5, parameters: 1e-5)
-            case .amx:
+            case .blas, .amx:
                 ComparisonTolerance(loss: 5e-4, activations: 5e-3, gradients: 5e-4, parameters: 5e-4)
+            case .bnns:
+                ComparisonTolerance(loss: 5e-3, activations: 7e-3, gradients: 7e-3, parameters: 7e-3)
             }
         }
     }
 
-    private static let metalTolerance = ComparisonTolerance(loss: 5e-3, activations: 7e-3, gradients: 7e-3, parameters: 7e-3)
+    private static let mlTensorTolerance = ComparisonTolerance(loss: 5e-3, activations: 7e-3, gradients: 7e-3, parameters: 7e-3)
 
     func testSyntheticForwardMatchesCReferenceAcrossEngines() throws {
         let fixture = try SyntheticFixture.make()
@@ -139,14 +159,41 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
 
         let basicSwift = try LLMBasicSwift.buildModel(from: fixture.checkpointData)
         let fastSwift = try LLMSwift.buildModel(from: fixture.checkpointData)
-        let multithreadedSwift = try LLMMultithreadedSwift.buildModel(from: fixture.checkpointData)
+        let blas = try LLMBLAS.buildModel(from: fixture.checkpointData)
         let amx = try LLMAMX.buildModel(from: fixture.checkpointData)
+        let bnns = try LLMBNNS.buildModel(from: fixture.checkpointData)
 
         try assertCheckpointRoundTrip(basicSwift.exportCheckpoint(), expected: expected, engineName: EngineCase.basicSwift.name)
         try assertCheckpointRoundTrip(fastSwift.exportCheckpoint(), expected: expected, engineName: EngineCase.fastSwift.name)
-        try assertCheckpointRoundTrip(multithreadedSwift.exportCheckpoint(), expected: expected, engineName: EngineCase.multithreadedSwift.name)
+        try assertCheckpointRoundTrip(blas.exportCheckpoint(), expected: expected, engineName: EngineCase.blas.name)
         try assertCheckpointRoundTrip(amx.exportCheckpoint(), expected: expected, engineName: EngineCase.amx.name)
+        try assertCheckpointRoundTrip(bnns.exportCheckpoint(), expected: expected, engineName: EngineCase.bnns.name)
     }
+
+    func testBNNSLatestTokenInferenceMatchesFullLogitsRow() throws {
+        let fixture = try SyntheticFixture.make()
+        var model = try LLMBNNS.buildModel(from: fixture.checkpointData)
+        let inputs = Array(fixture.inputs.prefix(fixture.sequenceLength))
+        let rowIndex = 2
+
+        try LLMBNNS.gpt2_forward(model: &model, inputs: inputs, targets: [], B: 1, T: fixture.sequenceLength)
+        let rowLogits = try LLMBNNS.gpt2_latest_token_logits(model: &model, inputs: inputs, rowIndex: rowIndex, B: 1, T: fixture.sequenceLength)
+        let rowStart = rowIndex * model.config.padded_vocab_size
+
+        XCTAssertEqual(rowLogits.count, model.config.vocab_size)
+        for index in rowLogits.indices {
+            XCTAssertEqual(
+                rowLogits[index],
+                model.acts.logits[rowStart + index],
+                accuracy: EngineCase.bnns.tolerance.loss,
+                "BNNS latest-token logits mismatch at index \(index)"
+            )
+        }
+    }
+
+    // MARK: - Metal compute engine tests
+
+    private static let metalTolerance = ComparisonTolerance(loss: 5e-3, activations: 7e-3, gradients: 7e-3, parameters: 7e-3)
 
     func testMetalSyntheticForwardMatchesCReference() throws {
         let fixture = try SyntheticFixture.make()
@@ -194,16 +241,7 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
         let (header, parameters) = try LLMCheckpointCodec.decode(checkpointData)
         let config = LLMGPT2Config(header: header)
         let parameterData = parameters.withUnsafeBufferPointer { Data(buffer: $0) }
-        do {
-            return try GPT2Metal(config: config, parameterData: parameterData)
-        } catch let error as LLMMetalRuntimeError {
-            switch error {
-            case .failedToLoadShaders(let message):
-                throw XCTSkip("Skipping Metal synthetic tests: \(message)")
-            default:
-                throw error
-            }
-        }
+        return try GPT2Metal(config: config, parameterData: parameterData)
     }
 
     private func metalSnapshot(fixture: SyntheticFixture, phase: ExecutionPhase) throws -> ModelSnapshot {
@@ -226,7 +264,10 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
                 t: fixture.updateParams.t
             )
             model.forward(inputs: fixture.inputs, targets: fixture.targets, B: B, T: T)
-            model.backward()
+            // After update + re-forward, we need fresh backward for gradient comparison
+            if phase == .trainingStep {
+                model.backward()
+            }
         }
 
         return ModelSnapshot(
@@ -262,6 +303,7 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
         for l in 0..<L { values.append(contentsOf: read(acts.residual3[l])) }
         values.append(contentsOf: read(acts.lnf))
 
+        // Metal logits/probs use V columns; reference uses Vp. Pad to match.
         let logits = read(acts.logits)
         let probs = read(acts.probs)
         for bt in 0..<(B * T) {
@@ -274,6 +316,329 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
         }
         values.append(contentsOf: read(acts.losses))
         return values
+    }
+
+    // MARK: - MPSGraph engine tests
+    // MPSGraph compiles forward+backward+update into a fused executable, so only
+    // loss-level and checkpoint comparisons are possible (no activation/gradient access).
+
+    private static let mpsGraphTolerance = ComparisonTolerance(loss: 5e-3, activations: 0, gradients: 0, parameters: 5e-3)
+
+    func testMPSGraphSyntheticForwardLossMatchesCReference() throws {
+        let fixture = try SyntheticFixture.make()
+        let reference = try CReferenceHarness(checkpointData: fixture.checkpointData)
+        let referenceSnapshot = try reference.runForward(inputs: fixture.inputs, targets: fixture.targets, B: fixture.batchSize, T: fixture.sequenceLength)
+
+        let model = try buildMPSModel(from: fixture.checkpointData)
+        let loss = model.performLossEstimation(inputs: fixture.inputs, targets: fixture.targets, B: fixture.batchSize, T: fixture.sequenceLength)
+        XCTAssertEqual(loss, referenceSnapshot.meanLoss, accuracy: Self.mpsGraphTolerance.loss, "MPSGraph forward loss mismatch")
+    }
+
+    func testMPSGraphLatestTokenInferenceMatchesFullLogitsRow() throws {
+        let fixture = try SyntheticFixture.make()
+        let model = try buildMPSModel(from: fixture.checkpointData)
+        let inputs = Array(fixture.inputs.prefix(fixture.sequenceLength))
+        let rowIndex = 2
+        let fullLogits = model.performInference(inputs: inputs, B: 1, T: fixture.sequenceLength)
+        let rowLogits = model.performLatestTokenInference(inputs: inputs, rowIndex: rowIndex, B: 1, T: fixture.sequenceLength)
+        let rowStart = rowIndex * rowLogits.count
+
+        XCTAssertEqual(rowLogits.count, 16)
+        for index in rowLogits.indices {
+            XCTAssertEqual(
+                rowLogits[index],
+                fullLogits[rowStart + index],
+                accuracy: Self.mpsGraphTolerance.loss,
+                "MPSGraph inference-only row logits mismatch at index \(index)"
+            )
+        }
+    }
+
+    func testMPSGraphSyntheticTrainingStepLossMatchesCReference() throws {
+        let fixture = try SyntheticFixture.make()
+        let reference = try CReferenceHarness(checkpointData: fixture.checkpointData)
+        let referenceSnapshot = try reference.runTrainingStep(
+            inputs: fixture.inputs,
+            targets: fixture.targets,
+            B: fixture.batchSize,
+            T: fixture.sequenceLength,
+            updateParams: fixture.updateParams
+        )
+
+        let model = try buildMPSModel(from: fixture.checkpointData)
+        _ = model.performTrainingStep(
+            inputs: fixture.inputs,
+            targets: fixture.targets,
+            B: fixture.batchSize,
+            T: fixture.sequenceLength,
+            learningRate: fixture.updateParams.learning_rate
+        )
+        let postUpdateLoss = model.performLossEstimation(inputs: fixture.inputs, targets: fixture.targets, B: fixture.batchSize, T: fixture.sequenceLength)
+        XCTAssertEqual(postUpdateLoss, referenceSnapshot.meanLoss, accuracy: Self.mpsGraphTolerance.loss, "MPSGraph training step loss mismatch")
+    }
+
+    func testMPSGraphSyntheticCheckpointRoundTrip() throws {
+        let fixture = try SyntheticFixture.make()
+        let expected = try LLMCheckpointCodec.decode(fixture.checkpointData)
+
+        let model = try buildMPSModel(from: fixture.checkpointData)
+        let exported = try model.exportCheckpoint()
+        try assertCheckpointRoundTrip(exported, expected: expected, engineName: "MPSGraph")
+    }
+
+    private func buildMPSModel(from checkpointData: Data) throws -> GPT2MPS {
+        let (header, parameters) = try LLMCheckpointCodec.decode(checkpointData)
+        let config = LLMGPT2Config(header: header)
+        let parameterData = parameters.withUnsafeBufferPointer { Data(buffer: $0) }
+        return try GPT2MPS(config: config, parameterData: parameterData)
+    }
+
+    // MARK: - MLTensor engine tests
+
+    func testMLTensorSyntheticForwardMatchesCReference() async throws {
+        let fixture = try SyntheticFixture.make()
+        let reference = try CReferenceHarness(checkpointData: fixture.checkpointData)
+        let referenceSnapshot = try reference.runForward(inputs: fixture.inputs, targets: fixture.targets, B: fixture.batchSize, T: fixture.sequenceLength)
+
+        let snapshot = try await mlTensorSnapshot(fixture: fixture, phase: .forward)
+        assertSnapshotMatchesReference(snapshot, reference: referenceSnapshot, tolerance: Self.mlTensorTolerance, engineName: "MLTensor", phaseName: "forward")
+    }
+
+    func testMLTensorSyntheticBackwardMatchesCReference() async throws {
+        let fixture = try SyntheticFixture.make()
+        let reference = try CReferenceHarness(checkpointData: fixture.checkpointData)
+        let referenceSnapshot = try reference.runBackward(inputs: fixture.inputs, targets: fixture.targets, B: fixture.batchSize, T: fixture.sequenceLength)
+
+        let snapshot = try await mlTensorSnapshot(fixture: fixture, phase: .backward)
+        assertSnapshotMatchesReference(snapshot, reference: referenceSnapshot, tolerance: Self.mlTensorTolerance, engineName: "MLTensor", phaseName: "backward")
+    }
+
+    func testMLTensorSyntheticTrainingStepMatchesCReference() async throws {
+        let fixture = try SyntheticFixture.make()
+        let reference = try CReferenceHarness(checkpointData: fixture.checkpointData)
+        let referenceSnapshot = try reference.runTrainingStep(
+            inputs: fixture.inputs,
+            targets: fixture.targets,
+            B: fixture.batchSize,
+            T: fixture.sequenceLength,
+            updateParams: fixture.updateParams
+        )
+
+        let snapshot = try await mlTensorSnapshot(fixture: fixture, phase: .trainingStep)
+        assertSnapshotMatchesReference(snapshot, reference: referenceSnapshot, tolerance: Self.mlTensorTolerance, engineName: "MLTensor", phaseName: "training step")
+    }
+
+    func testMLTensorSyntheticCheckpointRoundTrip() async throws {
+        let fixture = try SyntheticFixture.make()
+        let expected = try LLMCheckpointCodec.decode(fixture.checkpointData)
+
+        let (header, parameters) = try LLMCheckpointCodec.decode(fixture.checkpointData)
+        let config = LLMGPT2Config(header: header)
+        let model = GPT2MLTensor(config: config, parameters: parameters)
+        let exported = try await model.exportCheckpoint()
+        try assertCheckpointRoundTrip(exported, expected: expected, engineName: "MLTensor")
+    }
+
+    private func mlTensorSnapshot(fixture: SyntheticFixture, phase: ExecutionPhase) async throws -> ModelSnapshot {
+        let (header, parameters) = try LLMCheckpointCodec.decode(fixture.checkpointData)
+        let config = LLMGPT2Config(header: header)
+        let model = GPT2MLTensor(config: config, parameters: parameters)
+
+        let B = fixture.batchSize
+        let T = fixture.sequenceLength
+
+        let (acts, _) = model.forward(inputs: fixture.inputs, targets: fixture.targets, B: B, T: T)
+        let meanLoss = await acts.losses.mean().shapedArray(of: Float.self).scalar ?? 0
+
+        var gradients = [Float]()
+        if phase != .forward {
+            let grads = await model.backward(acts: acts, inputs: fixture.inputs, targets: fixture.targets, B: B, T: T)
+            if phase == .trainingStep {
+                LLMMLTensor.adamw_update(
+                    params: &model.params, grads: grads, m: &model.m_memory, v: &model.v_memory,
+                    learningRate: fixture.updateParams.learning_rate, beta1: fixture.updateParams.beta1,
+                    beta2: fixture.updateParams.beta2, eps: fixture.updateParams.eps,
+                    weightDecay: fixture.updateParams.weight_decay, t: fixture.updateParams.t
+                )
+                // Re-run forward after update to get post-update loss
+                let (acts2, _) = model.forward(inputs: fixture.inputs, targets: fixture.targets, B: B, T: T)
+                let postUpdateLoss = await acts2.losses.mean().shapedArray(of: Float.self).scalar ?? 0
+                let activations = await selectedMLTensorActivations(acts: acts2, config: config, B: B, T: T)
+                let params = await mlTensorParameters(model: model, config: config)
+                // Re-run backward to get post-update gradients
+                let postGrads = await model.backward(acts: acts2, inputs: fixture.inputs, targets: fixture.targets, B: B, T: T)
+                gradients = await mlTensorGradients(grads: postGrads, config: config)
+                return ModelSnapshot(meanLoss: postUpdateLoss, parameters: params, gradients: gradients, activations: activations)
+            }
+            gradients = await mlTensorGradients(grads: grads, config: config)
+        }
+
+        let activations = await selectedMLTensorActivations(acts: acts, config: config, B: B, T: T)
+        let params = await mlTensorParameters(model: model, config: config)
+        return ModelSnapshot(meanLoss: meanLoss, parameters: params, gradients: gradients, activations: activations)
+    }
+
+    private func mlTensorParameters(model: GPT2MLTensor, config: LLMGPT2Config) async -> [Float] {
+        // Must match the flattened order of LLMGPT2ParameterTensors
+        var result = [Float]()
+        result.reserveCapacity(config.num_parameters)
+
+        let V = config.vocab_size
+        let Vp = config.padded_vocab_size
+        let C = config.channels
+
+        // wte: pad from (V, C) to (Vp, C)
+        let wteScalars = await model.params.wte.shapedArray(of: Float.self).scalars
+        var paddedWte = [Float](repeating: 0, count: Vp * C)
+        for row in 0..<V {
+            paddedWte.replaceSubrange((row * C)..<(row * C + C), with: wteScalars[(row * C)..<(row * C + C)])
+        }
+        result.append(contentsOf: paddedWte)
+
+        result.append(contentsOf: await model.params.wpe.shapedArray(of: Float.self).scalars)
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.ln1w[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.ln1b[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.qkvw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.qkvb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.attprojw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.attprojb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.ln2w[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.ln2b[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.fcw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.fcb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.fcprojw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await model.params.fcprojb[l].shapedArray(of: Float.self).scalars) }
+        result.append(contentsOf: await model.params.lnfw.shapedArray(of: Float.self).scalars)
+        result.append(contentsOf: await model.params.lnfb.shapedArray(of: Float.self).scalars)
+        return result
+    }
+
+    private func mlTensorGradients(grads: LLMMLTensor.MLParameterTensors, config: LLMGPT2Config) async -> [Float] {
+        var result = [Float]()
+        result.reserveCapacity(config.num_parameters)
+
+        let V = config.vocab_size
+        let Vp = config.padded_vocab_size
+        let C = config.channels
+
+        // dwte: pad from (V, C) to (Vp, C)
+        let dwteScalars = await grads.wte.shapedArray(of: Float.self).scalars
+        var paddedDwte = [Float](repeating: 0, count: Vp * C)
+        for row in 0..<V {
+            paddedDwte.replaceSubrange((row * C)..<(row * C + C), with: dwteScalars[(row * C)..<(row * C + C)])
+        }
+        result.append(contentsOf: paddedDwte)
+
+        // dwpe: may be (T, C) rather than (maxT, C), pad to full size
+        let dwpeScalars = await grads.wpe.shapedArray(of: Float.self).scalars
+        var paddedDwpe = [Float](repeating: 0, count: config.max_seq_len * C)
+        paddedDwpe.replaceSubrange(0..<dwpeScalars.count, with: dwpeScalars)
+        result.append(contentsOf: paddedDwpe)
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.ln1w[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.ln1b[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.qkvw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.qkvb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.attprojw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.attprojb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.ln2w[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.ln2b[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.fcw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.fcb[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.fcprojw[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { result.append(contentsOf: await grads.fcprojb[l].shapedArray(of: Float.self).scalars) }
+        result.append(contentsOf: await grads.lnfw.shapedArray(of: Float.self).scalars)
+        result.append(contentsOf: await grads.lnfb.shapedArray(of: Float.self).scalars)
+        return result
+    }
+
+    private func selectedMLTensorActivations(acts: LLMMLTensor.MLActivationTensors, config: LLMGPT2Config, B: Int, T: Int) async -> [Float] {
+        let Vp = config.padded_vocab_size
+        let V = config.vocab_size
+        var values = [Float]()
+
+        values.append(contentsOf: await acts.encoded.shapedArray(of: Float.self).scalars)
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.ln1[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.qkv[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.atty[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.att[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.attproj[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.fch_gelu[l].shapedArray(of: Float.self).scalars) }
+        for l in 0..<config.num_layers { values.append(contentsOf: await acts.residual3[l].shapedArray(of: Float.self).scalars) }
+        values.append(contentsOf: await acts.lnf.shapedArray(of: Float.self).scalars)
+
+        // logits and probs: MLTensor uses V (unpadded), reference uses Vp (padded)
+        let logitsScalars = await acts.logits.shapedArray(of: Float.self).scalars
+        let probsScalars = await acts.probs.shapedArray(of: Float.self).scalars
+        // Pad logits from (B*T, V) to (B*T, Vp)
+        for bt in 0..<(B * T) {
+            values.append(contentsOf: logitsScalars[(bt * V)..<(bt * V + V)])
+            values.append(contentsOf: [Float](repeating: 0, count: Vp - V))
+        }
+        // Pad probs from (B*T, V) to (B*T, Vp)
+        for bt in 0..<(B * T) {
+            values.append(contentsOf: probsScalars[(bt * V)..<(bt * V + V)])
+            values.append(contentsOf: [Float](repeating: 0, count: Vp - V))
+        }
+        values.append(contentsOf: await acts.losses.shapedArray(of: Float.self).scalars)
+        return values
+    }
+
+    private func collectTrainingProgress(
+        from stream: AsyncThrowingStream<LLMTrainingProgress, Error>
+    ) async throws -> [LLMTrainingProgress] {
+        var progress: [LLMTrainingProgress] = []
+        for try await sample in stream {
+            progress.append(sample)
+        }
+        return progress
+    }
+
+    private func unwrapTrainingLosses(
+        from progress: [LLMTrainingProgress],
+        engineName: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [Double] {
+        try progress.enumerated().map { index, sample in
+            guard let trainingLoss = sample.trainingLoss else {
+                XCTFail("\(engineName) step \(index + 1) did not report a training loss", file: file, line: line)
+                struct MissingTrainingLoss: Error {}
+                throw MissingTrainingLoss()
+            }
+            return trainingLoss
+        }
+    }
+
+    private func attachTrainingSummary(
+        for progress: [LLMTrainingProgress],
+        engineName: String,
+        wallClockSeconds: Double
+    ) {
+        guard progress.isEmpty == false else {
+            return
+        }
+
+        let averageIterationsPerSecond = progress.compactMap(\.iterationsPerSecond).average
+        let averageForwardMilliseconds = progress.compactMap(\.forwardPassMilliseconds).average
+        let averageBackwardMilliseconds = progress.compactMap(\.backwardPassMilliseconds).average
+        let lossSummary = progress.enumerated().compactMap { index, sample -> String? in
+            guard let trainingLoss = sample.trainingLoss else {
+                return nil
+            }
+            return "step \(index + 1): \(String(format: "%.5f", trainingLoss))"
+        }.joined(separator: ", ")
+
+        let summary = """
+        Engine: \(engineName)
+        Steps: \(progress.count)
+        Wall clock seconds: \(String(format: "%.3f", wallClockSeconds))
+        Average iterations/s: \(averageIterationsPerSecond.map { String(format: "%.4f", $0) } ?? "n/a")
+        Average forward ms: \(averageForwardMilliseconds.map { String(format: "%.3f", $0) } ?? "n/a")
+        Average backward ms: \(averageBackwardMilliseconds.map { String(format: "%.3f", $0) } ?? "n/a")
+        Training losses: \(lossSummary)
+        """
+
+        print(summary)
     }
 
     private enum ExecutionPhase {
@@ -314,16 +679,16 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
                 activations: { selectedForwardActivations(from: $0.acts) },
                 meanLoss: { $0.mean_loss }
             )
-        case .multithreadedSwift:
-            var model = try LLMMultithreadedSwift.buildModel(from: fixture.checkpointData)
+        case .blas:
+            var model = try LLMBLAS.buildModel(from: fixture.checkpointData)
             return try execute(
                 model: &model,
                 fixture: fixture,
                 phase: phase,
-                forward: { LLMMultithreadedSwift.gpt2_forward(model: &$0, inputs: $1, targets: $2, B: $3, T: $4) },
-                zeroGrad: { LLMMultithreadedSwift.gpt2_zero_grad(model: &$0) },
-                backward: { LLMMultithreadedSwift.gpt2_backward(model: &$0) },
-                update: { LLMMultithreadedSwift.gpt2_update(model: &$0, update_params: $1) },
+                forward: { LLMBLAS.gpt2_forward(model: &$0, inputs: $1, targets: $2, B: $3, T: $4) },
+                zeroGrad: { LLMBLAS.gpt2_zero_grad(model: &$0) },
+                backward: { LLMBLAS.gpt2_backward(model: &$0) },
+                update: { LLMBLAS.gpt2_update(model: &$0, update_params: $1) },
                 parameters: { $0.params.flattened() },
                 gradients: { $0.grads.flattened() },
                 activations: { selectedForwardActivations(from: $0.acts) },
@@ -339,6 +704,21 @@ final class LLMEngineSyntheticComparisonTests: XCTestCase {
                 zeroGrad: { LLMAMX.gpt2_zero_grad(model: &$0) },
                 backward: { LLMAMX.gpt2_backward(model: &$0) },
                 update: { LLMAMX.gpt2_update(model: &$0, update_params: $1) },
+                parameters: { $0.params.flattened() },
+                gradients: { $0.grads.flattened() },
+                activations: { selectedForwardActivations(from: $0.acts) },
+                meanLoss: { $0.mean_loss }
+            )
+        case .bnns:
+            var model = try LLMBNNS.buildModel(from: fixture.checkpointData)
+            return try execute(
+                model: &model,
+                fixture: fixture,
+                phase: phase,
+                forward: { try LLMBNNS.gpt2_forward(model: &$0, inputs: $1, targets: $2, B: $3, T: $4) },
+                zeroGrad: { LLMBNNS.gpt2_zero_grad(model: &$0) },
+                backward: { LLMBNNS.gpt2_backward(model: &$0) },
+                update: { LLMBNNS.gpt2_update(model: &$0, update_params: $1) },
                 parameters: { $0.params.flattened() },
                 gradients: { $0.grads.flattened() },
                 activations: { selectedForwardActivations(from: $0.acts) },

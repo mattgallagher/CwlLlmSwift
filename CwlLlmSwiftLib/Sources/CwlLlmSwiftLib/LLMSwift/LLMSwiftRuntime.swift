@@ -3,7 +3,6 @@ import Foundation
 enum LLMSwiftRuntimeError: LocalizedError {
     case missingCheckpoint
     case failedToCreateModel
-    case invalidDataset(String)
     case tokenizerRequired
 
     var errorDescription: String? {
@@ -12,142 +11,57 @@ enum LLMSwiftRuntimeError: LocalizedError {
             return "A checkpoint is required before running the fast Swift backend."
         case .failedToCreateModel:
             return "Failed to create the fast Swift model runtime."
-        case .invalidDataset(let message):
-            return message
         case .tokenizerRequired:
             return "Inference requires a tokenizer asset."
         }
     }
 }
 
-private struct LLMSwiftTokenDataLoader {
-    private static let headerCount = 256
-    private static let magic: UInt32 = 20240520
-    private static let version: UInt32 = 1
+extension LLMSwift.GPT2: LLMTrainingSequenceLengthProviding {
+    var maximumTrainingSequenceLength: Int { config.max_seq_len }
+}
 
-    let batchSize: Int
-    let sequenceLength: Int
-    let tokenCount: Int
-    let sampleCount: Int
+extension LLMSwiftRuntime: LLMTrainingStreamRuntime, LLMInferenceStreamRuntime {
+    typealias Model = LLMSwift.GPT2
 
-    private let tokens: [UInt16]
-    private(set) var currentSampleIndex = 0
-    private(set) var inputs: [UInt32]
-    private(set) var targets: [UInt32]
-
-    init(data: Data, batchSize: Int, sequenceLength: Int) throws {
-        let headerBytes = Self.headerCount * MemoryLayout<UInt32>.size
-        guard data.count >= headerBytes else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard is too small to contain a valid header.")
-        }
-
-        let header = data.withUnsafeBytes { rawBuffer in
-            Array(rawBuffer.bindMemory(to: UInt32.self).prefix(Self.headerCount))
-        }
-        guard header.count >= 3 else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard header is incomplete.")
-        }
-        guard header[0] == Self.magic else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard has invalid magic value \(header[0]).")
-        }
-        guard header[1] == Self.version else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard uses unsupported version \(header[1]).")
-        }
-
-        let tokenCount = Int(header[2])
-        let payload = data.dropFirst(headerBytes)
-        let tokens = payload.withUnsafeBytes { rawBuffer in
-            Array(rawBuffer.bindMemory(to: UInt16.self))
-        }
-        guard tokens.count == tokenCount else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard token count mismatch: header says \(tokenCount), file contains \(tokens.count).")
-        }
-        guard tokenCount >= batchSize * sequenceLength + 1 else {
-            throw LLMSwiftRuntimeError.invalidDataset("Dataset shard does not contain enough tokens for a batch of size \(batchSize) and sequence length \(sequenceLength).")
-        }
-
-        self.batchSize = batchSize
-        self.sequenceLength = sequenceLength
-        self.tokenCount = tokenCount
-        self.sampleCount = max(1, (tokenCount - 1) / (batchSize * sequenceLength))
-        self.tokens = tokens
-        self.inputs = Array(repeating: 0, count: batchSize * sequenceLength)
-        self.targets = Array(repeating: 0, count: batchSize * sequenceLength)
-    }
-
-    mutating func reset() {
-        currentSampleIndex = 0
-    }
-
-    mutating func nextBatch() {
-        if currentSampleIndex >= sampleCount {
-            currentSampleIndex = 0
-        }
-        let start = currentSampleIndex * batchSize * sequenceLength
-        for index in 0..<(batchSize * sequenceLength) {
-            inputs[index] = UInt32(tokens[start + index])
-            targets[index] = UInt32(tokens[start + index + 1])
-        }
-        currentSampleIndex += 1
-    }
+    nonisolated var descriptor: LLMEngineDescriptor { LLMEngineDescriptor(
+        id: .fastSwift,
+        displayName: "Fast Swift",
+        summary: "Optimized pure Swift backend derived from the train_gpt2.swift translation, keeping the shared Swift runtime while applying targeted low-level speedups.",
+        capabilities: [.training, .inference, .checkpointing],
+        isAvailable: true,
+        availabilityNote: "Fast Swift backend supports training, generation, and checkpoint export/load."
+    ) }
 }
 
 actor LLMSwiftRuntime {
-    private var model: LLMSwift.GPT2?
     private var currentCheckpointData: Data?
-    private var trainData: Data?
-    private var validationData: Data?
     private var tokenizerData: Data?
     private var batchSize = 4
     private var sequenceLength = 64
-    private var completedStepCount = 0
 
     func loadCheckpoint(data: Data) async throws {
         currentCheckpointData = data
-        completedStepCount = 0
-        model = try LLMSwift.buildModel(from: data)
     }
 
     func exportCheckpoint() async throws -> Data {
-        try ensureModel()
-        guard let model else {
+        guard let currentCheckpointData else {
             throw LLMSwiftRuntimeError.missingCheckpoint
         }
-        let checkpointData = try model.exportCheckpoint()
-        currentCheckpointData = checkpointData
-        return checkpointData
+        return currentCheckpointData
     }
 
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        trainData = request.trainData
-        validationData = request.validationData
+    func prepareTraining(request: LLMTrainingRequest) async throws -> LLMSwift.GPT2 {
         tokenizerData = request.tokenizerData
         batchSize = request.batchSize
         sequenceLength = request.sequenceLength
         if let checkpointData = request.checkpointData {
             currentCheckpointData = checkpointData
         }
-        completedStepCount = 0
-        try recreateModel()
-
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self.trainingLoop(request: request, continuation: continuation)
-                    self.releaseTrainingState()
-                    continuation.finish()
-                } catch {
-                    self.releaseTrainingState()
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
-        }
+        return try recreateModel()
     }
 
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
+    func prepareInference(request: LLMInferenceRequest) async throws -> LLMInferenceContext<LLMSwift.GPT2> {
         if let checkpointData = request.checkpointData {
             currentCheckpointData = checkpointData
         }
@@ -159,89 +73,65 @@ actor LLMSwiftRuntime {
         }
 
         let tokenizer = try LLMTokenizer(data: tokenizerData)
-        try ensureModel()
-        guard let model else {
-            throw LLMSwiftRuntimeError.failedToCreateModel
-        }
+        let model = try recreateModel()
 
         let promptTokens = tokenizer.encodePrompt(request.prompt, maximumTokenCount: min(request.maximumTokenCount, model.config.max_seq_len))
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self.inferenceLoop(tokenizer: tokenizer, promptTokens: promptTokens, request: request, continuation: continuation)
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
-        }
+        return LLMInferenceContext(model: model, tokenizer: tokenizer, promptTokens: promptTokens)
     }
 
-    private func trainingLoop(request: LLMTrainingRequest, continuation: AsyncThrowingStream<LLMTrainingProgress, Error>.Continuation) async throws {
-        try ensureModel()
-        guard var model else {
-            throw LLMSwiftRuntimeError.failedToCreateModel
-        }
-        guard let trainData, let validationData else {
-            throw LLMSwiftRuntimeError.failedToCreateModel
-        }
-
-        var trainLoader = try LLMSwiftTokenDataLoader(data: trainData, batchSize: batchSize, sequenceLength: min(sequenceLength, model.config.max_seq_len))
-        var validationLoader = try LLMSwiftTokenDataLoader(data: validationData, batchSize: batchSize, sequenceLength: min(sequenceLength, model.config.max_seq_len))
-        let effectiveSequenceLength = min(sequenceLength, model.config.max_seq_len)
-
-        for _ in 0..<request.stepCount {
-            try Task.checkCancellation()
-            let stepStart = ContinuousClock.now
-            trainLoader.nextBatch()
-            let forwardStart = ContinuousClock.now
-            LLMSwift.gpt2_forward(model: &model, inputs: trainLoader.inputs, targets: trainLoader.targets, B: batchSize, T: effectiveSequenceLength)
-            let forwardPassMilliseconds = forwardStart.duration(to: .now).timeInterval * 1_000
-            try Task.checkCancellation()
-            LLMSwift.gpt2_zero_grad(model: &model)
-            let backwardStart = ContinuousClock.now
-            LLMSwift.gpt2_backward(model: &model)
-            let backwardPassMilliseconds = backwardStart.duration(to: .now).timeInterval * 1_000
-            try Task.checkCancellation()
-            LLMSwift.gpt2_update(
-                model: &model,
-                update_params: LLMSwift.UpdateParams(
-                    learning_rate: Float(request.learningRate),
-                    beta1: 0.9,
-                    beta2: 0.999,
-                    eps: 1e-8,
-                    weight_decay: 0,
-                    t: completedStepCount + 1
+    func trainingLoop(model: inout LLMSwift.GPT2, request: LLMTrainingRequest, preparationStart: ContinuousClock.Instant, continuation: AsyncThrowingStream<LLMTrainingProgress, Error>.Continuation) async throws {
+        try await LLMTrainingLoop.run(
+            isolatedTo: self,
+            model: &model,
+            request: request,
+            preparationStart: preparationStart,
+            continuation: continuation,
+            trainStep: { _, model, trainLoader, optimizerStep in
+                trainLoader.nextBatch()
+                let forwardStart = ContinuousClock.now
+                LLMSwift.gpt2_forward(model: &model, inputs: trainLoader.inputs, targets: trainLoader.targets, B: trainLoader.batchSize, T: trainLoader.sequenceLength)
+                let forwardPassMilliseconds = forwardStart.duration(to: .now).timeInterval * 1_000
+                try Task.checkCancellation()
+                LLMSwift.gpt2_zero_grad(model: &model)
+                let backwardStart = ContinuousClock.now
+                LLMSwift.gpt2_backward(model: &model)
+                let backwardPassMilliseconds = backwardStart.duration(to: .now).timeInterval * 1_000
+                try Task.checkCancellation()
+                LLMSwift.gpt2_update(
+                    model: &model,
+                    update_params: LLMSwift.UpdateParams(
+                        learning_rate: Float(request.learningRate),
+                        beta1: 0.9,
+                        beta2: 0.999,
+                        eps: 1e-8,
+                        weight_decay: 0,
+                        t: optimizerStep
+                    )
                 )
-            )
-            let elapsed = stepStart.duration(to: .now)
-            completedStepCount += 1
-            let trainingLoss = Double(model.mean_loss)
-            let validationLoss = try computeValidationLoss(using: &model, loader: &validationLoader, batchCount: request.validationBatchCount, sequenceLength: effectiveSequenceLength)
-
-            continuation.yield(
-                LLMTrainingProgress(
-                    step: completedStepCount,
-                    iterationsPerSecond: elapsed.components.seconds > 0 || elapsed.components.attoseconds > 0 ? 1 / elapsed.timeInterval : nil,
+                return LLMTrainingStepResult(
                     forwardPassMilliseconds: forwardPassMilliseconds,
                     backwardPassMilliseconds: backwardPassMilliseconds,
-                    trainingLoss: trainingLoss,
-                    validationLoss: validationLoss
+                    trainingLoss: Double(model.mean_loss)
                 )
-            )
-        }
-
-        currentCheckpointData = try model.exportCheckpoint()
+            },
+            validationLoss: { engine, model, validationLoader, _, _ in
+                try engine.computeValidationLoss(
+                    using: &model,
+                    loader: &validationLoader,
+                    batchCount: request.validationBatchCount,
+                    sequenceLength: validationLoader.sequenceLength
+                )
+            },
+            exportCheckpoint: { engine, model in
+                engine.currentCheckpointData = try model.exportCheckpoint()
+            }
+        )
     }
 
-    private func inferenceLoop(tokenizer: LLMTokenizer, promptTokens: [Int], request: LLMInferenceRequest, continuation: AsyncThrowingStream<LLMInferenceChunk, Error>.Continuation) async throws {
-        try ensureModel()
-        guard var model else {
-            throw LLMSwiftRuntimeError.failedToCreateModel
-        }
+    func inferenceLoop(context: LLMInferenceContext<LLMSwift.GPT2>, request: LLMInferenceRequest, continuation: AsyncThrowingStream<LLMInferenceChunk, Error>.Continuation) async throws {
+        var model = context.model
+        let tokenizer = context.tokenizer
+        let promptTokens = context.promptTokens
 
         let effectiveSequenceLength = min(sequenceLength, model.config.max_seq_len)
         let totalCount = min(effectiveSequenceLength, promptTokens.count + request.maximumTokenCount)
@@ -267,31 +157,18 @@ actor LLMSwiftRuntime {
             generatedTokenCount += 1
             continuation.yield(LLMInferenceChunk(text: tokenizer.decode(token: nextToken), generatedTokenCount: generatedTokenCount))
         }
-
-        self.model = model
     }
 
-    private func ensureModel() throws {
-        if model == nil {
-            try recreateModel()
-        }
-    }
-
-    private func recreateModel() throws {
+    private func recreateModel() throws -> LLMSwift.GPT2 {
         guard let currentCheckpointData else {
             throw LLMSwiftRuntimeError.missingCheckpoint
         }
-        model = try LLMSwift.buildModel(from: currentCheckpointData)
+        return try LLMSwift.buildModel(from: currentCheckpointData)
     }
 
-    // Drops the in-memory model and dataset buffers after a training run so
-    // running multiple engines back-to-back (e.g. on the Comparison screen)
-    // doesn't accumulate ~3-4GB of state per engine. The model can be rebuilt
-    // on demand from `currentCheckpointData` if inference or export follows.
-    private func releaseTrainingState() {
-        model = nil
-        trainData = nil
-        validationData = nil
+    // Drops request-scoped training assets after a run while retaining the
+    // latest checkpoint for export or follow-up inference.
+    func releaseTrainingState() async {
         tokenizerData = nil
     }
 
@@ -299,13 +176,12 @@ actor LLMSwiftRuntime {
     // checkpoint, so a fully idle engine retains effectively nothing. Callers
     // (e.g. the Comparison screen) invoke this when they're done with an
     // engine for now and don't intend to immediately call exportCheckpoint.
-    func releaseResources() {
-        releaseTrainingState()
+    func releaseResources() async {
+        await releaseTrainingState()
         currentCheckpointData = nil
-        completedStepCount = 0
     }
 
-    private func computeValidationLoss(using model: inout LLMSwift.GPT2, loader: inout LLMSwiftTokenDataLoader, batchCount: Int, sequenceLength: Int) throws -> Double? {
+    private func computeValidationLoss(using model: inout LLMSwift.GPT2, loader: inout LLMTokenDataLoader, batchCount: Int, sequenceLength: Int) throws -> Double? {
         guard batchCount > 0 else {
             return nil
         }
@@ -319,11 +195,5 @@ actor LLMSwiftRuntime {
             total += Double(model.mean_loss)
         }
         return total / Double(batchCount)
-    }
-}
-
-private extension Duration {
-    var timeInterval: Double {
-        Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

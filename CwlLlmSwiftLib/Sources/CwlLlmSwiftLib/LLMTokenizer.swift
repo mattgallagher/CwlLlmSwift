@@ -1,6 +1,6 @@
 import Foundation
 
-struct LLMTokenizer {
+struct LLMTokenizer: Sendable {
     private let tokenDataByID: [Data]
     private let tokenIDByData: [Data: Int]
     private let maxTokenLength: Int

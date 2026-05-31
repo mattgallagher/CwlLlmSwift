@@ -35,6 +35,19 @@ struct ComparisonEngineResult: Identifiable, Sendable {
     var timeToFirstOutputMilliseconds: Double?
     var totalElapsedSeconds: Double?
     var errorMessage: String?
+
+    var averageIterationsPerSecond: Double? {
+        guard progress.step > 1,
+              let totalElapsedSeconds,
+              let timeToFirstOutputMilliseconds else {
+            return nil
+        }
+        let measuredSeconds = totalElapsedSeconds - timeToFirstOutputMilliseconds / 1_000
+        guard measuredSeconds > 0 else {
+            return nil
+        }
+        return Double(progress.step - 1) / measuredSeconds
+    }
 }
 
 struct ComparisonView: View {
@@ -137,7 +150,7 @@ struct ComparisonView: View {
                         }
                         TableColumn("Step") { Text("\($0.progress.step)") }
                         TableColumn("First (ms)") { Text(formattedMilliseconds($0.timeToFirstOutputMilliseconds)) }
-                        TableColumn("Iter / s") { Text(formattedRate($0.progress.iterationsPerSecond)) }
+                        TableColumn("Avg iter / s") { Text(formattedRate($0.averageIterationsPerSecond)) }
                         TableColumn("Fwd (ms)") { Text(formattedMilliseconds($0.progress.forwardPassMilliseconds)) }
                         TableColumn("Bwd (ms)") { Text(formattedMilliseconds($0.progress.backwardPassMilliseconds)) }
                         TableColumn("Train loss") { Text(formattedLoss($0.progress.trainingLoss)) }

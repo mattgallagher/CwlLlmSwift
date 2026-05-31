@@ -4,7 +4,11 @@ public enum LLMEngineIdentifier: String, CaseIterable, Codable, Sendable {
     case basicSwift = "basic-swift"
     case fastSwift = "fast-swift"
     case multithreadedSwift = "multithreaded-swift"
+    case blas = "blas"
     case amx = "amx"
+    case bnns = "bnns"
+    case mpsGraph = "mps-graph"
+    case mlTensor = "ml-tensor"
     case metal = "metal"
     case cReference = "c-reference"
 }
@@ -194,6 +198,8 @@ public enum LLMEngineError: LocalizedError, Equatable {
 }
 
 public protocol LLMEngine: Sendable {
+    associatedtype Model
+
     var descriptor: LLMEngineDescriptor { get }
 
     func loadCheckpoint(data: Data) async throws
@@ -201,10 +207,10 @@ public protocol LLMEngine: Sendable {
     func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error>
     func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error>
     func runInference(request: LLMInferenceRequest) async throws -> LLMInferenceResponse
-    /// Drops every cached buffer on the engine — model, datasets, and the
-    /// post-training checkpoint copy. Use this when a caller knows it's done
-    /// with an engine for now (e.g. the Comparison screen between engines)
-    /// to avoid retaining ~500 MB of GPT-2 checkpoint per idle engine.
+    /// Drops cached training assets and the post-training checkpoint copy. Use
+    /// this when a caller knows it's done with an engine for now (e.g. the
+    /// Comparison screen between engines) to avoid retaining ~500 MB of GPT-2
+    /// checkpoint per idle engine.
     func releaseResources() async
 }
 
@@ -223,17 +229,98 @@ public extension LLMEngine {
     func releaseResources() async {}
 }
 
+protocol LLMTrainingStreamRuntime: LLMEngine, Actor {
+    func prepareTraining(request: LLMTrainingRequest) async throws -> Model
+    func trainingLoop(
+        model: inout Model,
+        request: LLMTrainingRequest,
+        preparationStart: ContinuousClock.Instant,
+        continuation: AsyncThrowingStream<LLMTrainingProgress, Error>.Continuation
+    ) async throws
+    func releaseTrainingState() async
+}
+
+extension LLMTrainingStreamRuntime {
+    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.runTrainingStream(request: request, continuation: continuation)
+                    continuation.finish()
+                } catch {
+                    await self.releaseTrainingState()
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func runTrainingStream(
+        request: LLMTrainingRequest,
+        continuation: AsyncThrowingStream<LLMTrainingProgress, Error>.Continuation
+    ) async throws {
+        let preparationStart = ContinuousClock.now
+        var model = try await prepareTraining(request: request)
+        try await trainingLoop(model: &model, request: request, preparationStart: preparationStart, continuation: continuation)
+        await releaseTrainingState()
+    }
+}
+
+struct LLMInferenceContext<Model>: @unchecked Sendable {
+    let model: Model
+    let tokenizer: LLMTokenizer
+    let promptTokens: [Int]
+}
+
+protocol LLMInferenceStreamRuntime: LLMEngine {
+    associatedtype InferenceContext: Sendable
+
+    func prepareInference(request: LLMInferenceRequest) async throws -> InferenceContext
+    func inferenceLoop(
+        context: InferenceContext,
+        request: LLMInferenceRequest,
+        continuation: AsyncThrowingStream<LLMInferenceChunk, Error>.Continuation
+    ) async throws
+}
+
+extension LLMInferenceStreamRuntime {
+    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
+        let context = try await prepareInference(request: request)
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.inferenceLoop(context: context, request: request, continuation: continuation)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
 public struct LLMEngineRegistry: Sendable {
     private let engines: [any LLMEngine]
 
     public init() {
         self.engines = [
-            CReferenceValidationEngine(),
-            BasicSwiftEngine(),
-            FastSwiftEngine(),
-            MultithreadedSwiftEngine(),
-            AMXEngine(),
-            MetalEngine()
+            LLMCReferenceRuntime(),
+            LLMBasicSwiftRuntime(),
+            LLMSwiftRuntime(),
+            LLMMultithreadedSwiftRuntime(),
+            LLMAMXRuntime(),
+            LLMMetalRuntime(),
+            LLMBLASRuntime(),
+            LLMBNNSRuntime(),
+            LLMMPSRuntime(),
+            LLMMLTensorRuntime()
         ]
     }
 
@@ -247,6 +334,8 @@ public struct LLMEngineRegistry: Sendable {
 }
 
 private struct StubEngineBase: LLMEngine {
+    typealias Model = Void
+
     let descriptor: LLMEngineDescriptor
 
     func loadCheckpoint(data: Data) async throws {
@@ -263,199 +352,5 @@ private struct StubEngineBase: LLMEngine {
 
     func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
         throw LLMEngineError.unsupportedOperation("\(descriptor.displayName) inference is not implemented yet.")
-    }
-}
-
-struct BasicSwiftEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .basicSwift,
-        displayName: "Basic Swift",
-        summary: "Naive pure Swift backend that keeps the train_gpt2.swift structure close to the straightforward reference implementation.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: true,
-        availabilityNote: "Basic Swift backend supports training, generation, and checkpoint export/load."
-    )
-    let runtime = LLMBasicSwiftRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
-    }
-}
-
-struct FastSwiftEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .fastSwift,
-        displayName: "Fast Swift",
-        summary: "Optimized pure Swift backend derived from the train_gpt2.swift translation, keeping the shared Swift runtime while applying targeted low-level speedups.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: true,
-        availabilityNote: "Fast Swift backend supports training, generation, and checkpoint export/load."
-    )
-    let runtime = LLMSwiftRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
-    }
-}
-
-struct AMXEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .amx,
-        displayName: "Direct AMX",
-        summary: "Direct Apple AMX backend that replaces the BLAS engine's GEMM calls with explicit AMX microkernels while keeping the surrounding train_gpt2-style Swift structure comparable.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: LLMAMXBridge.isAvailable,
-        availabilityNote: LLMAMXBridge.isAvailable
-            ? "AMX backend supports training, generation, and checkpoint export/load via direct AMX matmul kernels."
-            : "AMX backend requires Apple Silicon with the private AMX instruction set."
-    )
-    let runtime = LLMAMXRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
-    }
-}
-
-struct MultithreadedSwiftEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .multithreadedSwift,
-        displayName: "Multithreaded Swift",
-        summary: "Optimized pure Swift backend derived from the fast Swift implementation, adding CPU-parallel matmul and attention kernels with Dispatch concurrent work sharing.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: true,
-        availabilityNote: "Multithreaded Swift backend supports training, generation, and checkpoint export/load."
-    )
-    let runtime = LLMMultithreadedSwiftRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
-    }
-}
-
-struct MetalEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .metal,
-        displayName: "Metal",
-        summary: "Custom Metal compute backend using explicit GPU kernels for forward/backward passes and MPS for matrix multiply.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: true,
-        availabilityNote: "Metal backend supports training, generation, and checkpoint export/load via GPU compute shaders."
-    )
-    let runtime = LLMMetalRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
-    }
-}
-
-struct CReferenceValidationEngine: LLMEngine {
-    let descriptor = LLMEngineDescriptor(
-        id: .cReference,
-        displayName: "llm.c",
-        summary: "Vendored CPU reference path from train_gpt2.c for training, inference, checkpointing, and numerical validation.",
-        capabilities: [.training, .inference, .checkpointing],
-        isAvailable: true,
-        availabilityNote: "Reference backend supports training, generation, and checkpoint export/load."
-    )
-    let runtime = LLMCReferenceRuntime()
-
-    func loadCheckpoint(data: Data) async throws {
-        try await runtime.loadCheckpoint(data: data)
-    }
-
-    func exportCheckpoint() async throws -> Data {
-        try await runtime.exportCheckpoint()
-    }
-
-    func startTraining(request: LLMTrainingRequest) async throws -> AsyncThrowingStream<LLMTrainingProgress, Error> {
-        try await runtime.startTraining(request: request)
-    }
-
-    func startInference(request: LLMInferenceRequest) async throws -> AsyncThrowingStream<LLMInferenceChunk, Error> {
-        try await runtime.startInference(request: request)
-    }
-
-    func releaseResources() async {
-        await runtime.releaseResources()
     }
 }
